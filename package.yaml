@@ -1,0 +1,11 @@
+name: parallel-py
+version: 0.1.0
+homepage: https://github.com/morloclib/parallel-py
+synopsis: Python (multiprocessing) implementations for the parallel module
+description: Fork-pool implementations of the parallel combinators.
+category: control
+license: MIT
+author: "Zebulun Arendsee"
+maintainer: "z@morloc.io"
+github: https://github.com/morloclib/parallel-py
+bug-reports: https://github.com/morloclib/parallel-py

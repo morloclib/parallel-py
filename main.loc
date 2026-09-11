@@ -1,0 +1,21 @@
+--' Python implementations of the `parallel` module.
+--'
+--' Workers are processes. A morloc manifold is ordinary Python and the GIL
+--' would serialize it, so threads would give a `pmap` that returns the right
+--' answer and no speedup -- which is worse than not shipping one. The pool
+--' template forces the `fork` start method on every platform so a worker
+--' inherits the manifolds it has to call.
+module parallel-py (*)
+
+import parallel
+import root-py
+
+record Py => ParOpts = "dict"
+
+source Py from "parallel.py"
+  ( "morloc_pmap_with" as pmapWith
+  , "morloc_pfilter_with" as pfilterWith
+  , "morloc_pconcat_map_with" as pconcatMapWith
+  , "morloc_psconcat_map_with" as psconcatMapWith
+  , "morloc_psfold_with" as psfoldWith
+  )

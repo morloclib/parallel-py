@@ -1,0 +1,4 @@
+module test-parallel-py (test)
+
+import parallel.test (test)
+import parallel-py
