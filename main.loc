@@ -2,9 +2,10 @@
 --'
 --' Workers are processes. A morloc manifold is ordinary Python and the GIL
 --' would serialize it, so threads would give a `pmap` that returns the right
---' answer and no speedup -- which is worse than not shipping one. The pool
---' template forces the `fork` start method on every platform so a worker
---' inherits the manifolds it has to call.
+--' answer and no speedup -- which is worse than not shipping one. Workers are
+--' forked so they inherit the manifolds they call; a work unit's elements are
+--' pickled to its worker only in a stream stage, whose batches arrive after
+--' the fork.
 module parallel-py (*)
 
 import parallel
@@ -16,6 +17,8 @@ source Py from "parallel.py"
   ( "morloc_pmap_with" as pmapWith
   , "morloc_pfilter_with" as pfilterWith
   , "morloc_pconcat_map_with" as pconcatMapWith
-  , "morloc_psconcat_map_with" as psconcatMapWith
-  , "morloc_psfold_with" as psfoldWith
+  , "morloc_psconcat_map_native" as psconcatMapNative
+  , "morloc_psmap_native" as psmapNative
+  , "morloc_psfilter_native" as psfilterNative
+  , "morloc_psfold_native" as psfoldNative
   )

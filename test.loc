@@ -1,4 +1,13 @@
 module test-parallel-py (test)
 
-import parallel.test (test)
+import parallel.test (test, synthOpen, synthNext, sinkOpen, sinkPut, sinkBatches)
 import parallel-py
+import text-py
+
+source Py from "testlib.py"
+  ( "synth_open" as synthOpen
+  , "synth_next" as synthNext
+  , "sink_open" as sinkOpen
+  , "sink_put" as sinkPut
+  , "sink_batches" as sinkBatches
+  )

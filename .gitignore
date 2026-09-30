@@ -3,3 +3,7 @@ test
 bench
 bench-build
 __pycache__/
+bench-cross
+bench-cross-build
+*.log
+*.dat

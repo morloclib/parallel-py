@@ -1,0 +1,2 @@
+benchmark-template:
+  summary: "BENCH\t{group}\t{name}\t{lang}\t{count}\t{mean}\t{total}"

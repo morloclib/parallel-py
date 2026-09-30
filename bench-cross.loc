@@ -1,0 +1,8 @@
+module bench-cross-parallel-py (seqMap, parMap)
+
+-- The Python pmap over a C++ `spin`: every element crosses into the C++ pool.
+import parallel.bench
+import parallel-py
+import root-cpp
+
+source Cpp from "../parallel-cpp/benchcosts.hpp" ("spin", "spinKeep", "spinList", "makeStr", "strCost")

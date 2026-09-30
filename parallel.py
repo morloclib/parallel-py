@@ -1,19 +1,20 @@
 """Fork-pool implementations of the morloc `parallel` module.
 
 Workers are processes, not threads: a morloc manifold is ordinary Python and
-the GIL would serialize it. `pool.py` forces the `fork` start method on every
-platform precisely so a worker inherits the manifolds exec'd into the pool's
-globals, which is what lets a mapped function be a morloc closure -- including
-one that calls into another language.
+the GIL would serialize it. Workers are forked so they inherit the manifolds
+exec'd into the pool's globals, which is what lets a mapped function be a
+morloc closure -- including one that calls into another language.
 
-Work units are index ranges rather than element lists. A range is a pair of
-ints whatever the elements weigh, so the schedule is decided without pickling
-anything, and a worker slices the input it already inherited.
+For the list functions, work units are index ranges rather than element
+lists. A range is a pair of ints whatever the elements weigh, so the schedule
+is decided without pickling anything, and a worker slices the input it already
+inherited. Results are pickled back.
 """
 
+import itertools
 import multiprocessing
-import threading
 import os
+import queue
 
 # Tag order follows the `data ParChunking` declaration in parallel/main.loc.
 EVEN_CHUNKS = 0
@@ -69,51 +70,66 @@ def _ranges(n, opts):
 
 
 # The mapped function and the input list reach workers by fork inheritance
-# rather than by pickling. Setting them here before the pool is created means
-# each child snapshots them at fork, so a task carries only its (lo, hi) pair
-# -- otherwise every unit would re-pickle the entire input, which for a list of
-# sequences costs more than the work being parallelized.
+# rather than by pickling. Registering them here before the pool is created
+# means each child snapshots them at fork, so a task carries only a token and a
+# (lo, hi) pair -- otherwise every unit would re-pickle the entire input, which
+# for a list of sequences costs more than the work being parallelized.
 #
-# The lock makes the handoff safe under the thread-model pool (macOS), where
-# two dispatches can be in flight in one process.
-_CTX = None
-_CTX_LOCK = threading.Lock()
+# Each dispatch has its own token, so concurrent dispatches (the thread-model
+# pool) and nested ones (a mapped function that itself calls pmap) never share
+# an entry. No lock is held across the fork: a child would inherit it held.
+_CONTEXTS = {}
+_TOKENS = itertools.count()
+
+# `fork` is required, not preferred: a morloc manifold lives in the pool's
+# globals, not in an importable module, so a spawned or forkserver child could
+# not find it. Named explicitly because the platform default is not `fork`
+# everywhere.
+_FORK = multiprocessing.get_context("fork")
 
 
-def _apply_range(span):
-    fn, xs = _CTX
-    lo, hi = span
+def _apply_range(task):
+    token, lo, hi = task
+    fn, xs = _CONTEXTS[token]
     return [fn(x) for x in xs[lo:hi]]
 
 
-def _apply_range_concat(span):
-    fn, xs = _CTX
-    lo, hi = span
+def _apply_range_concat(task):
+    token, lo, hi = task
+    fn, xs = _CONTEXTS[token]
     out = []
     for x in xs[lo:hi]:
         out.extend(fn(x))
     return out
 
 
+def _in_worker():
+    """True inside a pool worker. Workers are daemonic, and a daemonic process
+    may not have children, so a nested dispatch runs inline -- the outer level
+    already occupies every core."""
+    return multiprocessing.current_process().daemon
+
+
 def _run(opts, worker, fn, xs):
     """Dispatch `worker` over the schedule and return per-unit results in input
-    order. A single unit runs inline: forking to hand one worker the whole list
-    buys nothing and costs a process."""
-    global _CTX
+    order. With one effective worker the units run inline: forking to hand one
+    process the whole list buys nothing and costs a process."""
     spans = _ranges(len(xs), opts)
     if not spans:
         return []
-    with _CTX_LOCK:
-        _CTX = (fn, xs)
-        try:
-            if len(spans) == 1:
-                return [worker(spans[0])]
-            with multiprocessing.Pool(processes=_workers(opts)) as pool:
-                # chunksize=1 because the schedule IS the chunking; letting the
-                # pool batch units on top of it would undo the shrinking tail.
-                return pool.map(worker, spans, chunksize=1)
-        finally:
-            _CTX = None
+    nproc = min(_workers(opts), len(spans))
+    token = next(_TOKENS)
+    _CONTEXTS[token] = (fn, xs)
+    try:
+        tasks = [(token, lo, hi) for lo, hi in spans]
+        if nproc == 1 or _in_worker():
+            return [worker(t) for t in tasks]
+        with _FORK.Pool(processes=nproc) as pool:
+            # chunksize=1 because the schedule IS the chunking; letting the
+            # pool batch units on top of it would undo the shrinking tail.
+            return pool.map(worker, tasks, chunksize=1)
+    finally:
+        del _CONTEXTS[token]
 
 
 def morloc_pmap_with(opts, fn, xs):
@@ -132,53 +148,170 @@ def morloc_pfilter_with(opts, pred, xs):
     return [x for x, k in zip(xs, keep) if k]
 
 
-# ── Streams ────────────────────────────────────────────────────────────────
+# Streams
+# -------
 #
-# The loop lives here rather than in morloc because a suspended computation
-# passed as a parameter is serialized under its result schema when a recursive
-# call crosses a manifold boundary, so the natural recursive stage does not
-# survive. See /work/plans/parallel-issues.md.
+# A stream stage is a pipeline. This process pulls batches and sinks results,
+# because that is where the source and sink handles live; a pool forked once
+# per stage maps work units. A unit's elements are pickled to a worker (a batch
+# pulled after the fork cannot be inherited), while the mapped function is
+# inherited through the token-keyed context like the list functions.
 #
-# A `Try e a` value crosses as a ("constructor", (fields...)) pair, so `Ok xs`
-# arrives as ("Ok", (xs,)).
+# `inflight` counts units dispatched and not yet delivered to the sink, so it
+# bounds the reorder buffer as well as the units queued at the pool.
 
-def _unwrap_try(t):
-    tag, fields = t
-    if tag == "Err":
-        raise RuntimeError(fields[0])
-    return fields[0]
+
+MAP, CONCAT, FILTER = 0, 1, 2
+
+
+def _apply_unit(mode, fn, chunk):
+    if mode == MAP:
+        return [fn(x) for x in chunk]
+    if mode == FILTER:
+        return [x for x in chunk if fn(x)]
+    out = []
+    for x in chunk:
+        out.extend(fn(x))
+    return out
+
+
+def _stream_unit(task):
+    token, mode, chunk = task
+    return _apply_unit(mode, _CONTEXTS[token], chunk)
+
+
+def _inflight(opts, w):
+    return max(1, _int_opt(opts, "inflight", 2 * w))
 
 
 def _ordered(opts):
     return int(opts.get("order", INPUT_ORDER)) == INPUT_ORDER
 
 
-def morloc_psconcat_map_with(opts, fn, pull, sink):
-    """Pull batches, map each batch's elements in parallel, push the results.
+def _pipeline(opts, fn, mode, pull, deliver, ordered):
+    """Run a stream stage. `deliver` receives each unit's results in the order
+    the stage promises. Returns (True, "") at end of stream, or (False, msg)
+    after a read failure, once every dispatched unit has been delivered. A
+    failure in a worker or in `deliver` propagates."""
+    w = _workers(opts)
+    if w == 1 or _in_worker():
+        return _pipeline_inline(opts, fn, mode, pull, deliver)
 
-    A batch is the unit the source already chose (a stream sub-packet), so it
-    is also the unit of parallelism: the pool is built per batch and the sink
-    runs in this process, which is where the output handle lives.
-    """
+    token = next(_TOKENS)
+    _CONTEXTS[token] = fn
+    done = queue.Queue()
+    try:
+        with _FORK.Pool(processes=w) as pool:
+            return _pipeline_pool(opts, w, token, mode, pull, deliver, ordered, pool, done)
+    finally:
+        del _CONTEXTS[token]
+
+
+def _pipeline_pool(opts, w, token, mode, pull, deliver, ordered, pool, done):
+    limit = _inflight(opts, w)
+    spans = []           # units of the current batch not yet dispatched
+    batch = None
+    reading = True       # False once the source is exhausted or failed
+    status = (True, "")
+    failure = None       # first worker failure
+    next_seq = 0         # sequence number of the next unit dispatched
+    next_out = 0         # sequence number of the next unit delivered (in order)
+    running = 0          # dispatched and not yet completed
+    undelivered = 0      # dispatched and not yet delivered
+    held = {}            # completed units waiting for an earlier one
+
+    def dispatch(seq, chunk):
+        pool.apply_async(
+            _stream_unit,
+            ((token, mode, chunk),),
+            callback=lambda r, seq=seq: done.put((seq, True, r)),
+            error_callback=lambda e, seq=seq: done.put((seq, False, e)),
+        )
+
     while True:
-        batch = _unwrap_try(pull())
-        if not batch:
-            return None
-        sink(morloc_pconcat_map_with(opts, fn, batch))
+        while reading and failure is None and undelivered < limit:
+            if not spans:
+                ok, msg, batch = pull()
+                if not ok:
+                    reading, status = False, (False, msg)
+                    break
+                if not batch:
+                    reading = False
+                    break
+                spans = _ranges(len(batch), opts)
+                spans.reverse()
+            lo, hi = spans.pop()
+            dispatch(next_seq, batch[lo:hi])
+            next_seq += 1
+            running += 1
+            undelivered += 1
+
+        if running == 0:
+            break
+
+        seq, ok, result = done.get()
+        running -= 1
+        if not ok:
+            if failure is None:
+                failure = result
+            continue
+        if failure is not None:
+            continue
+        if ordered:
+            held[seq] = result
+            while next_out in held:
+                ys = held.pop(next_out)
+                next_out += 1
+                undelivered -= 1
+                if ys:
+                    deliver(ys)
+        else:
+            undelivered -= 1
+            if result:
+                deliver(result)
+
+    if failure is not None:
+        raise failure
+    return status
 
 
-def morloc_psfold_with(opts, combine, identity, fn, pull):
-    """Reduce a stream as batches arrive.
-
-    Partials are combined in batch order, so the answer does not depend on
-    which worker finished first. That is what makes a run reproducible for a
-    non-associative `combine` such as floating-point addition -- provided the
-    chunking is itself deterministic (see ParChunking).
-    """
-    acc = identity
+def _pipeline_inline(opts, fn, mode, pull, deliver):
+    """The same contract with one worker, or inside a pool worker (which may
+    not fork): units run in this process in input order."""
     while True:
-        batch = _unwrap_try(pull())
+        ok, msg, batch = pull()
+        if not ok:
+            return (False, msg)
         if not batch:
-            return ("Ok", (acc,))
-        for y in morloc_pmap_with(opts, fn, batch):
-            acc = combine(acc, y)
+            return (True, "")
+        for lo, hi in _ranges(len(batch), opts):
+            ys = _apply_unit(mode, fn, batch[lo:hi])
+            if ys:
+                deliver(ys)
+
+
+def morloc_psconcat_map_native(opts, fn, pull, sink):
+    return _pipeline(opts, fn, CONCAT, pull, sink, _ordered(opts))
+
+
+def morloc_psmap_native(opts, fn, pull, sink):
+    return _pipeline(opts, fn, MAP, pull, sink, _ordered(opts))
+
+
+def morloc_psfilter_native(opts, pred, pull, sink):
+    return _pipeline(opts, pred, FILTER, pull, sink, _ordered(opts))
+
+
+def morloc_psfold_native(opts, combine, identity, fn, pull):
+    # The fold always consumes results in input order, whatever `order` asks:
+    # a fixed fold order is what makes the answer schedule-independent.
+    acc = [identity]
+
+    def deliver(ys):
+        a = acc[0]
+        for y in ys:
+            a = combine(a, y)
+        acc[0] = a
+
+    ok, msg = _pipeline(opts, fn, MAP, pull, deliver, True)
+    return (ok, msg, acc[0])
