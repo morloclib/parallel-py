@@ -32,7 +32,14 @@ def _int_opt(opts, key, fallback):
 
 
 def _workers(opts):
-    return _int_opt(opts, "workers", os.cpu_count() or 1)
+    """`workers`, else a positive MORLOC_THREADS, else every core."""
+    try:
+        fallback = int(os.environ.get("MORLOC_THREADS", ""))
+    except ValueError:
+        fallback = 0
+    if fallback <= 0:
+        fallback = os.cpu_count() or 1
+    return _int_opt(opts, "workers", fallback)
 
 
 def _ranges(n, opts):
@@ -315,3 +322,170 @@ def morloc_psfold_native(opts, combine, identity, fn, pull):
 
     ok, msg = _pipeline(opts, fn, MAP, pull, deliver, True)
     return (ok, msg, acc[0])
+
+
+# Reductions
+# ----------
+#
+# A unit's result is its summary (and, for the indexed form, its value for the
+# effect); the units of a batch are its schedule's ranges. Results reach the
+# merge in stream order, in this process.
+
+
+class _Merges:
+    """Summaries merged in stream order as a binary counter: adjacent results
+    of equal rank merge, so each summary takes part in O(log n) merges."""
+
+    def __init__(self, merge):
+        self.merge = merge
+        self.stack = []
+
+    def push(self, b):
+        r = 0
+        while self.stack and self.stack[-1][0] == r:
+            _, top = self.stack.pop()
+            b = self.merge(top, b)
+            r += 1
+        self.stack.append((r, b))
+
+    def finish(self, empty):
+        if not self.stack:
+            return empty
+        acc = self.stack[0][1]
+        for _, b in self.stack[1:]:
+            acc = self.merge(acc, b)
+        return acc
+
+
+def _reduce_unit(task):
+    token, at, chunk = task
+    return [_CONTEXTS[token](at, chunk)]
+
+
+def _limited(pull, limit):
+    """`pull` cut to its first `limit` elements; all of them when `limit` is
+    not positive."""
+    if limit <= 0:
+        return pull
+    left = [limit]
+
+    def next_batch():
+        if left[0] <= 0:
+            return (True, "", [])
+        ok, msg, xs = pull()
+        if ok:
+            xs = xs[: left[0]]
+            left[0] -= len(xs)
+        return (ok, msg, xs)
+
+    return next_batch
+
+
+def _reduce(opts, limit, compute, pull, deliver):
+    """Run `compute(offset, unit)` over every unit and hand the results to
+    `deliver` in stream order. Returns (True, "") at the end of the stream or
+    (False, msg) after a read failure."""
+    pull = _limited(pull, limit)
+    w = _workers(opts)
+    offset = [0]
+    units = []
+
+    def indexed():
+        # A pull whose batches are (offset, unit) pairs, one unit each.
+        if not units:
+            ok, msg, xs = pull()
+            if not ok or not xs:
+                return (ok, msg, [])
+            units.extend(reversed([xs[lo:hi] for lo, hi in _ranges(len(xs), opts)]))
+        unit = units.pop()
+        at = offset[0]
+        offset[0] += len(unit)
+        return (True, "", [(at, unit)])
+
+    if w == 1 or _in_worker():
+        while True:
+            ok, msg, batch = indexed()
+            if not ok:
+                return (False, msg)
+            if not batch:
+                return (True, "")
+            at, unit = batch[0]
+            deliver(compute(at, unit))
+
+    token = next(_TOKENS)
+    _CONTEXTS[token] = compute
+    done = queue.Queue()
+
+    def deliver_unit(results):
+        for r in results:
+            deliver(r)
+
+    try:
+        with _FORK.Pool(processes=w) as pool:
+            return _reduce_pool(opts, w, token, indexed, deliver_unit, pool, done)
+    finally:
+        del _CONTEXTS[token]
+
+
+def _reduce_pool(opts, w, token, pull, deliver, pool, done):
+    limit = _inflight(opts, w)
+    reading = True
+    status = (True, "")
+    failure = None
+    next_seq = next_out = running = 0
+    held = {}
+
+    while True:
+        while reading and failure is None and next_seq - next_out < limit:
+            ok, msg, batch = pull()
+            if not ok:
+                reading, status = False, (False, msg)
+                break
+            if not batch:
+                reading = False
+                break
+            at, unit = batch[0]
+            pool.apply_async(
+                _reduce_unit,
+                ((token, at, unit),),
+                callback=lambda r, seq=next_seq: done.put((seq, True, r)),
+                error_callback=lambda e, seq=next_seq: done.put((seq, False, e)),
+            )
+            next_seq += 1
+            running += 1
+        if running == 0:
+            break
+        seq, ok, result = done.get()
+        running -= 1
+        if not ok:
+            if failure is None:
+                failure = result
+            continue
+        if failure is not None:
+            continue
+        held[seq] = result
+        while next_out in held:
+            deliver(held.pop(next_out))
+            next_out += 1
+
+    if failure is not None:
+        raise failure
+    return status
+
+
+def morloc_psreduce_native(opts, limit, summarize, merge, pull):
+    acc = _Merges(merge)
+    ok, msg = _reduce(opts, limit, lambda at, xs: summarize(xs), pull, acc.push)
+    return (ok, msg, acc.finish(summarize([])))
+
+
+def morloc_psreduce_indexed_native(opts, summarize, merge, effect, pull):
+    acc = _Merges(merge)
+
+    def deliver(r):
+        b, d = r
+        effect(d)
+        acc.push(b)
+
+    ok, msg = _reduce(opts, 0, summarize, pull, deliver)
+    return (ok, msg, acc.finish(summarize(0, [])[0]))

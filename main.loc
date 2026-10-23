@@ -21,4 +21,6 @@ source Py from "parallel.py"
   , "morloc_psmap_native" as psmapNative
   , "morloc_psfilter_native" as psfilterNative
   , "morloc_psfold_native" as psfoldNative
+  , "morloc_psreduce_native" as psreduceNative
+  , "morloc_psreduce_indexed_native" as psreduceIndexedNative
   )
