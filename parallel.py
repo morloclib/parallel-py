@@ -16,6 +16,8 @@ import multiprocessing
 import os
 import queue
 
+import pymorloc as morloc
+
 # Tag order follows the `data ParChunking` declaration in parallel/main.loc.
 EVEN_CHUNKS = 0
 SHRINKING_CHUNKS = 1
@@ -95,6 +97,17 @@ _TOKENS = itertools.count()
 _FORK = multiprocessing.get_context("fork")
 
 
+def _crossing(job):
+    """Run one unit in a worker. A failure goes back to the parent as text,
+    rendered here with the trace of the morloc functions it passed through:
+    the parent cannot always unpickle the exception itself."""
+    worker, task = job
+    try:
+        return worker(task)
+    except Exception as e:
+        raise RuntimeError(morloc.failure_message(e)) from None
+
+
 def _apply_range(task):
     token, lo, hi = task
     fn, xs = _CONTEXTS[token]
@@ -134,7 +147,7 @@ def _run(opts, worker, fn, xs):
         with _FORK.Pool(processes=nproc) as pool:
             # chunksize=1 because the schedule IS the chunking; letting the
             # pool batch units on top of it would undo the shrinking tail.
-            return pool.map(worker, tasks, chunksize=1)
+            return pool.map(_crossing, [(worker, t) for t in tasks], chunksize=1)
     finally:
         del _CONTEXTS[token]
 
@@ -229,8 +242,8 @@ def _pipeline_pool(opts, w, token, mode, pull, deliver, ordered, pool, done):
 
     def dispatch(seq, chunk):
         pool.apply_async(
-            _stream_unit,
-            ((token, mode, chunk),),
+            _crossing,
+            ((_stream_unit, (token, mode, chunk)),),
             callback=lambda r, seq=seq: done.put((seq, True, r)),
             error_callback=lambda e, seq=seq: done.put((seq, False, e)),
         )
