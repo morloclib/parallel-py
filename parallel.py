@@ -11,6 +11,7 @@ is decided without pickling anything, and a worker slices the input it already
 inherited. Results are pickled back.
 """
 
+import enum
 import itertools
 import multiprocessing
 import os
@@ -28,28 +29,56 @@ INPUT_ORDER = 0
 ARRIVAL_ORDER = 1
 
 
+def _tag(opts, key, fallback):
+    """The tag of an enumeration field: its position in the declaration. The
+    field arrives as the generated enum.Enum."""
+    v = opts.get(key)
+    if v is None:
+        return fallback
+    return v.value if isinstance(v, enum.Enum) else int(v)
+
+
 def _int_opt(opts, key, fallback):
     v = opts.get(key)
     return fallback if v is None or v <= 0 else int(v)
 
 
+_INT64_MAX = 2**63 - 1
+
+
+def _parse_count(text):
+    """A count written as ASCII digits with optional spaces around it, or 0
+    when the text is anything else or above 2^63 - 1."""
+    t = text.strip(" ")
+    if not t or any(c not in "0123456789" for c in t):
+        return 0
+    v = int(t)
+    return v if v <= _INT64_MAX else 0
+
+
+def _available_cpus():
+    """The CPUs this process may run on: its affinity mask, limited by any
+    cgroup CPU quota, as the runtime reads it at most once a second."""
+    return morloc.available_cpus()
+
+
 def _workers(opts):
-    """`workers`, else a positive MORLOC_THREADS, else every core."""
-    try:
-        fallback = int(os.environ.get("MORLOC_THREADS", ""))
-    except ValueError:
-        fallback = 0
-    if fallback <= 0:
-        fallback = os.cpu_count() or 1
-    return _int_opt(opts, "workers", fallback)
+    """`workers`, else MORLOC_THREADS, else the available CPUs. The rule is
+    specified on `ParOpts.workers` in parallel/main.loc."""
+    v = opts.get("workers")
+    if v is not None and v > 0:
+        return int(v)
+    k = _parse_count(os.environ.get("MORLOC_THREADS", ""))
+    return k if k > 0 else _available_cpus()
 
 
-def _ranges(n, opts):
-    """Split [0, n) into work units per the requested schedule."""
+def _ranges(n, opts, w):
+    """Split [0, n) into work units per the requested schedule, for `w`
+    workers."""
     if n <= 0:
         return []
-    w = max(1, _workers(opts))
-    mode = int(opts.get("chunking", SHRINKING_CHUNKS))
+    w = max(1, w)
+    mode = _tag(opts, "chunking", SHRINKING_CHUNKS)
 
     if mode == EVEN_CHUNKS:
         # One contiguous block per worker; no coordination beyond the dispatch.
@@ -132,14 +161,21 @@ def _in_worker():
 
 def _run(opts, worker, fn, xs):
     """Dispatch `worker` over the schedule and return per-unit results in input
-    order. With one effective worker the units run inline: forking to hand one
-    process the whole list buys nothing and costs a process."""
-    spans = _ranges(len(xs), opts)
+    order."""
+    w = 1 if len(xs) < 2 else _workers(opts)
+    return _dispatch(w, worker, (fn, xs), _ranges(len(xs), opts, w))
+
+
+def _dispatch(w, worker, context, spans):
+    """Run `worker` over `spans` on up to `w` processes that inherit `context`,
+    and return the per-unit results in span order. With one effective worker
+    the units run inline: forking to hand one process the whole list buys
+    nothing and costs a process."""
     if not spans:
         return []
-    nproc = min(_workers(opts), len(spans))
+    nproc = min(w, len(spans))
     token = next(_TOKENS)
-    _CONTEXTS[token] = (fn, xs)
+    _CONTEXTS[token] = context
     try:
         tasks = [(token, lo, hi) for lo, hi in spans]
         if nproc == 1 or _in_worker():
@@ -166,6 +202,38 @@ def morloc_pfilter_with(opts, pred, xs):
     parts = _run(opts, _apply_range, pred, xs)
     keep = [k for part in parts for k in part]
     return [x for x, k in zip(xs, keep) if k]
+
+
+# The blocks of `pfoldMapBlocks` over n elements are [k * size, (k + 1) * size)
+# cut at n, with size = ceil(n / MAX_FOLD_BLOCKS): they depend on n alone. The
+# C++ and Rust backends use the same blocks.
+MAX_FOLD_BLOCKS = 256
+
+
+def _fold_blocks(task):
+    token, lo, hi = task
+    fn, mconcat, xs, size = _CONTEXTS[token]
+    return [mconcat([fn(x) for x in xs[b * size:(b + 1) * size]]) for b in range(lo, hi)]
+
+
+def _block_units(nblocks, size, opts, w):
+    """The schedule's work units over `nblocks` blocks of `size` elements.
+    `chunkSize` counts elements, so a fixed unit holds ceil(chunkSize / size)
+    blocks."""
+    if _tag(opts, "chunking", SHRINKING_CHUNKS) == FIXED_CHUNKS:
+        opts = dict(opts, chunkSize=-(-_int_opt(opts, "chunkSize", 1) // size))
+    return _ranges(nblocks, opts, w)
+
+
+def morloc_pfold_map_blocks(opts, fn, mconcat, xs):
+    n = len(xs)
+    if n == 0:
+        return mconcat([])
+    size = -(-n // MAX_FOLD_BLOCKS)
+    nblocks = -(-n // size)
+    w = 1 if n < 2 else _workers(opts)
+    parts = _dispatch(w, _fold_blocks, (fn, mconcat, xs, size), _block_units(nblocks, size, opts, w))
+    return mconcat([m for part in parts for m in part])
 
 
 # Streams
@@ -205,7 +273,7 @@ def _inflight(opts, w):
 
 
 def _ordered(opts):
-    return int(opts.get("order", INPUT_ORDER)) == INPUT_ORDER
+    return _tag(opts, "order", INPUT_ORDER) == INPUT_ORDER
 
 
 def _pipeline(opts, fn, mode, pull, deliver, ordered):
@@ -215,7 +283,7 @@ def _pipeline(opts, fn, mode, pull, deliver, ordered):
     failure in a worker or in `deliver` propagates."""
     w = _workers(opts)
     if w == 1 or _in_worker():
-        return _pipeline_inline(opts, fn, mode, pull, deliver)
+        return _pipeline_inline(opts, w, fn, mode, pull, deliver)
 
     token = next(_TOKENS)
     _CONTEXTS[token] = fn
@@ -258,7 +326,7 @@ def _pipeline_pool(opts, w, token, mode, pull, deliver, ordered, pool, done):
                 if not batch:
                     reading = False
                     break
-                spans = _ranges(len(batch), opts)
+                spans = _ranges(len(batch), opts, w)
                 spans.reverse()
             lo, hi = spans.pop()
             dispatch(next_seq, batch[lo:hi])
@@ -295,7 +363,7 @@ def _pipeline_pool(opts, w, token, mode, pull, deliver, ordered, pool, done):
     return status
 
 
-def _pipeline_inline(opts, fn, mode, pull, deliver):
+def _pipeline_inline(opts, w, fn, mode, pull, deliver):
     """The same contract with one worker, or inside a pool worker (which may
     not fork): units run in this process in input order."""
     while True:
@@ -304,7 +372,7 @@ def _pipeline_inline(opts, fn, mode, pull, deliver):
             return (False, msg)
         if not batch:
             return (True, "")
-        for lo, hi in _ranges(len(batch), opts):
+        for lo, hi in _ranges(len(batch), opts, w):
             ys = _apply_unit(mode, fn, batch[lo:hi])
             if ys:
                 deliver(ys)
@@ -409,7 +477,7 @@ def _reduce(opts, limit, compute, pull, deliver):
             ok, msg, xs = pull()
             if not ok or not xs:
                 return (ok, msg, [])
-            units.extend(reversed([xs[lo:hi] for lo, hi in _ranges(len(xs), opts)]))
+            units.extend(reversed([xs[lo:hi] for lo, hi in _ranges(len(xs), opts, w)]))
         unit = units.pop()
         at = offset[0]
         offset[0] += len(unit)

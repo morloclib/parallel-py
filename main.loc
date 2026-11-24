@@ -11,12 +11,13 @@ module parallel-py (*)
 import parallel
 import root-py
 
-record Py => ParOpts = "dict"
+record Py => ParOpts = dict
 
 source Py from "parallel.py"
   ( "morloc_pmap_with" as pmapWith
   , "morloc_pfilter_with" as pfilterWith
   , "morloc_pconcat_map_with" as pconcatMapWith
+  , "morloc_pfold_map_blocks" as pfoldMapBlocks
   , "morloc_psconcat_map_native" as psconcatMapNative
   , "morloc_psmap_native" as psmapNative
   , "morloc_psfilter_native" as psfilterNative
